@@ -6,6 +6,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
+import * as readline from 'node:readline';
 import { makeRelative, shortenPath } from '../utils/paths.js';
 import type { ToolInvocation, ToolLocation, ToolResult } from './tools.js';
 import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
@@ -13,6 +14,9 @@ import { ToolNames } from './tool-names.js';
 import type { Config } from '../config/config.js';
 import { ToolErrorType } from './tool-error.js';
 import { generateWorkspacePathError } from './workspace-error-helper.js';
+
+const MAX_JSON_FILE_SIZE_MB = 100;
+const MAX_JSON_FILE_SIZE_BYTES = MAX_JSON_FILE_SIZE_MB * 1024 * 1024;
 
 /**
  * Parameters for the ReadDataFile tool
@@ -67,11 +71,68 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
   }
 
   /**
-   * Parse CSV file into structured data with comprehensive analysis
+   * Simple CSV line parser (handles basic cases including quoted fields)
    */
-  private async parseCSV(content: string): Promise<ParsedDataResult> {
-    const lines = content.trim().split('\n');
-    if (lines.length === 0) {
+  private parseCSVLine(line: string): Array<string> {
+    const result: Array<string> = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') {
+        inQuotes = !inQuotes;
+      } else if (char === ',' && !inQuotes) {
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  /**
+   * Parse CSV file using streaming to avoid memory exhaustion on large files
+   */
+  private async parseCSVStream(filePath: string): Promise<ParsedDataResult> {
+    const displayMaxRows = this.params.max_rows || 100;
+    const sampleData: Array<Record<string, string>> = [];
+    let headers: Array<string> = [];
+    let totalRows = 0;
+    let isFirstLine = true;
+
+    const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+
+      if (isFirstLine) {
+        headers = this.parseCSVLine(trimmedLine);
+        isFirstLine = false;
+        continue;
+      }
+
+      totalRows++;
+
+      // Only store rows up to displayMaxRows for the sample
+      if (sampleData.length < displayMaxRows) {
+        const values = this.parseCSVLine(trimmedLine);
+        const row: Record<string, string> = {};
+        headers.forEach((header, index) => {
+          row[header] = values[index] || '';
+        });
+        sampleData.push(row);
+      }
+    }
+
+    if (headers.length === 0) {
       return {
         fileType: 'CSV',
         data: [],
@@ -80,54 +141,14 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       };
     }
 
-    // Simple CSV parser (handles basic cases, not production-grade)
-    const parseCSVLine = (line: string): string[] => {
-      const result: string[] = [];
-      let current = '';
-      let inQuotes = false;
-
-      for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        if (char === '"') {
-          inQuotes = !inQuotes;
-        } else if (char === ',' && !inQuotes) {
-          result.push(current.trim());
-          current = '';
-        } else {
-          current += char;
-        }
-      }
-      result.push(current.trim());
-      return result;
-    };
-
-    const headers = parseCSVLine(lines[0]);
-    const totalRows = lines.length - 1;
-    
-    // Parse rows, limit display if max_rows is set
-    const allDataRows = lines.slice(1);
-    const displayMaxRows = this.params.max_rows || 100; // Default to 100 for display
-
-    // Parse data rows
-    const allData = allDataRows.map((line) => {
-      const values = parseCSVLine(line);
-      const row: Record<string, string> = {};
-      headers.forEach((header, index) => {
-        row[header] = values[index] || '';
-      });
-      return row;
-    });
-
-    // Data to display (limited if max_rows is set)
-    const displayData = displayMaxRows ? allData.slice(0, displayMaxRows) : allData;
-
-    const summaryText = displayMaxRows && totalRows > displayMaxRows
-      ? `CSV file with ${headers.length} columns and ${totalRows} rows (showing first ${displayMaxRows} rows)`
-      : `CSV file with ${headers.length} columns and ${totalRows} rows`;
+    const summaryText =
+      totalRows > displayMaxRows
+        ? `CSV file with ${headers.length} columns and ${totalRows} rows (showing first ${displayMaxRows} rows)`
+        : `CSV file with ${headers.length} columns and ${totalRows} rows`;
 
     return {
       fileType: 'CSV',
-      data: displayData,
+      data: sampleData,
       summary: summaryText,
       rowCount: totalRows,
       columnCount: headers.length,
@@ -176,18 +197,31 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
   }
 
   /**
-   * Parse TXT file (treat as plain text with line-by-line analysis)
+   * Parse TXT file using streaming to avoid memory exhaustion on large files
    */
-  private async parseTXT(content: string): Promise<ParsedDataResult> {
-    const lines = content.split('\n');
+  private async parseTXTStream(filePath: string): Promise<ParsedDataResult> {
     const maxRows = this.params.max_rows || 100;
-    const limitedLines = lines.slice(0, maxRows);
+    const sampleLines: Array<string> = [];
+    let totalLines = 0;
+
+    const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      totalLines++;
+      if (sampleLines.length < maxRows) {
+        sampleLines.push(line);
+      }
+    }
 
     return {
       fileType: 'TXT',
-      data: limitedLines,
-      summary: `Text file with ${lines.length} lines (showing first ${limitedLines.length} lines)`,
-      rowCount: lines.length,
+      data: sampleLines,
+      summary: `Text file with ${totalLines} lines (showing first ${sampleLines.length} lines)`,
+      rowCount: totalLines,
     };
   }
 
@@ -198,10 +232,10 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
     try {
       // Dynamic import to handle optional dependency - use default export
       const { default: XLSX } = await import('xlsx');
-      
+
       const workbook = XLSX.readFile(filePath);
       const sheetNames = workbook.SheetNames;
-      
+
       if (sheetNames.length === 0) {
         return {
           fileType: 'XLSX',
@@ -212,27 +246,27 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       }
 
       const maxRows = this.params.max_rows || 100;
-      
+
       // Parse all sheets and collect their data
       const allSheetsData: Record<string, unknown[]> = {};
       let totalRows = 0;
       let firstSheetColumns: string[] = [];
-      
+
       for (const sheetName of sheetNames) {
         const worksheet = workbook.Sheets[sheetName];
-        
+
         // Convert to JSON with proper options
         const jsonData = XLSX.utils.sheet_to_json(worksheet, {
           raw: false, // Format numbers and dates
           defval: '', // Default value for empty cells
         });
-        
+
         allSheetsData[sheetName] = jsonData;
         totalRows += jsonData.length;
-        
+
         // Get column names from first sheet's first row
-        if (sheetName === sheetNames[0] && jsonData.length > 0 && 
-            typeof jsonData[0] === 'object' && jsonData[0] !== null) {
+        if (sheetName === sheetNames[0] && jsonData.length > 0 &&
+          typeof jsonData[0] === 'object' && jsonData[0] !== null) {
           firstSheetColumns = Object.keys(jsonData[0] as Record<string, unknown>);
         }
       }
@@ -243,7 +277,7 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       const limitedData = firstSheetData.slice(0, maxRows);
 
       // Create a summary of all sheets
-      const sheetsSummary = sheetNames.map(name => 
+      const sheetsSummary = sheetNames.map(name =>
         `"${name}" (${allSheetsData[name]?.length || 0} rows)`
       ).join(', ');
 
@@ -268,7 +302,7 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND' ||
-          (error as Error).message?.includes('Cannot find module')) {
+        (error as Error).message?.includes('Cannot find module')) {
         return {
           fileType: 'XLSX',
           data: null,
@@ -289,10 +323,10 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
     try {
       // Dynamic import to handle optional dependency - use default export
       const { default: mammoth } = await import('mammoth');
-      
+
       const result = await mammoth.extractRawText({ path: filePath });
       const text = result.value;
-      
+
       // Split into paragraphs
       const paragraphs = text
         .split('\n')
@@ -310,7 +344,7 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND' ||
-          (error as Error).message?.includes('Cannot find module')) {
+        (error as Error).message?.includes('Cannot find module')) {
         return {
           fileType: 'DOCX',
           data: null,
@@ -362,18 +396,30 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       // Parse based on file type
       switch (ext) {
         case '.csv': {
-          const content = await fs.promises.readFile(filePath, 'utf-8');
-          result = await this.parseCSV(content);
+          // Use streaming parser to avoid memory exhaustion on large files
+          result = await this.parseCSVStream(filePath);
           break;
         }
         case '.json': {
+          // JSON cannot be streamed easily, so enforce a file size limit
+          if (stats.size > MAX_JSON_FILE_SIZE_BYTES) {
+            const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+            return {
+              llmContent: `JSON file is too large (${fileSizeMB} MB). Maximum supported size for JSON files is ${MAX_JSON_FILE_SIZE_MB} MB. For large JSON files, write a Python script using the 'json' module with streaming (ijson) or load in chunks.`,
+              returnDisplay: `JSON file too large (${fileSizeMB} MB, max ${MAX_JSON_FILE_SIZE_MB} MB)`,
+              error: {
+                message: `JSON file size (${fileSizeMB} MB) exceeds ${MAX_JSON_FILE_SIZE_MB} MB limit`,
+                type: ToolErrorType.FILE_TOO_LARGE,
+              },
+            };
+          }
           const content = await fs.promises.readFile(filePath, 'utf-8');
           result = await this.parseJSON(content);
           break;
         }
         case '.txt': {
-          const content = await fs.promises.readFile(filePath, 'utf-8');
-          result = await this.parseTXT(content);
+          // Use streaming parser to avoid memory exhaustion on large files
+          result = await this.parseTXTStream(filePath);
           break;
         }
         case '.xlsx':
