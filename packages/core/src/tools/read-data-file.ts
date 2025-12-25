@@ -109,27 +109,32 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       crlfDelay: Infinity,
     });
 
-    for await (const line of rl) {
-      const trimmedLine = line.trim();
-      if (!trimmedLine) continue;
+    try {
+      for await (const line of rl) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) continue;
 
-      if (isFirstLine) {
-        headers = this.parseCSVLine(trimmedLine);
-        isFirstLine = false;
-        continue;
+        if (isFirstLine) {
+          headers = this.parseCSVLine(trimmedLine);
+          isFirstLine = false;
+          continue;
+        }
+
+        totalRows++;
+
+        // Only store rows up to displayMaxRows for the sample
+        if (sampleData.length < displayMaxRows) {
+          const values = this.parseCSVLine(trimmedLine);
+          const row: Record<string, string> = {};
+          headers.forEach((header, index) => {
+            row[header] = values[index] || '';
+          });
+          sampleData.push(row);
+        }
       }
-
-      totalRows++;
-
-      // Only store rows up to displayMaxRows for the sample
-      if (sampleData.length < displayMaxRows) {
-        const values = this.parseCSVLine(trimmedLine);
-        const row: Record<string, string> = {};
-        headers.forEach((header, index) => {
-          row[header] = values[index] || '';
-        });
-        sampleData.push(row);
-      }
+    } finally {
+      rl.close();
+      fileStream.destroy();
     }
 
     if (headers.length === 0) {
@@ -210,11 +215,16 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
       crlfDelay: Infinity,
     });
 
-    for await (const line of rl) {
-      totalLines++;
-      if (sampleLines.length < maxRows) {
-        sampleLines.push(line);
+    try {
+      for await (const line of rl) {
+        totalLines++;
+        if (sampleLines.length < maxRows) {
+          sampleLines.push(line);
+        }
       }
+    } finally {
+      rl.close();
+      fileStream.destroy();
     }
 
     return {
@@ -405,7 +415,7 @@ class ReadDataFileToolInvocation extends BaseToolInvocation<
           if (stats.size > MAX_JSON_FILE_SIZE_BYTES) {
             const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
             return {
-              llmContent: `JSON file is too large (${fileSizeMB} MB). Maximum supported size for JSON files is ${MAX_JSON_FILE_SIZE_MB} MB. For large JSON files, write a Python script using the 'json' module with streaming (ijson) or load in chunks.`,
+              llmContent: `JSON file is too large (${fileSizeMB} MB). Maximum supported size for JSON files is ${MAX_JSON_FILE_SIZE_MB} MB. For large JSON files, use Python with a streaming JSON parser to process the data in chunks.`,
               returnDisplay: `JSON file too large (${fileSizeMB} MB, max ${MAX_JSON_FILE_SIZE_MB} MB)`,
               error: {
                 message: `JSON file size (${fileSizeMB} MB) exceeds ${MAX_JSON_FILE_SIZE_MB} MB limit`,
