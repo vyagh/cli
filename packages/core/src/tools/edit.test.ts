@@ -589,6 +589,33 @@ describe('EditTool', () => {
       const result = await invocation.execute(new AbortController().signal);
       expect(result.error?.type).toBe(ToolErrorType.FILE_WRITE_FAILURE);
     });
+
+    it('should return FILE_MODIFIED_DURING_WAIT error if file changed between confirmation and execute', async () => {
+      fs.writeFileSync(filePath, 'original content', 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: 'original',
+        new_string: 'modified',
+      };
+      const invocation = tool.build(params);
+
+      // Simulate confirmation flow - this captures mtime
+      await invocation.shouldConfirmExecute(new AbortController().signal);
+
+      // Simulate external modification after confirmation
+      // Use utimesSync to guarantee a different mtime (works on all filesystems)
+      fs.writeFileSync(filePath, 'externally modified content', 'utf8');
+      const futureTime = new Date(Date.now() + 2000);
+      fs.utimesSync(filePath, futureTime, futureTime);
+
+      // Execute should detect the race condition
+      const result = await invocation.execute(new AbortController().signal);
+      expect(result.error?.type).toBe(
+        ToolErrorType.EDIT_FILE_MODIFIED_DURING_WAIT,
+      );
+      expect(result.llmContent).toContain('modified externally');
+    });
   });
 
   describe('getDescription', () => {

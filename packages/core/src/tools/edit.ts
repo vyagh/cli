@@ -101,10 +101,16 @@ interface CalculatedEdit {
 }
 
 class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
+  /**
+   * Stores the file's mtime at the time it was read for confirmation.
+   * Used to detect if the file was modified externally before we write.
+   */
+  private readMtimeMs?: number;
+
   constructor(
     private readonly config: Config,
     public params: EditToolParams,
-  ) {}
+  ) { }
 
   toolLocations(): ToolLocation[] {
     return [{ path: this.params.file_path }];
@@ -195,11 +201,11 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
 
     const newContent = !error
       ? applyReplacement(
-          currentContent,
-          finalOldString,
-          finalNewString,
-          isNewFile,
-        )
+        currentContent,
+        finalOldString,
+        finalNewString,
+        isNewFile,
+      )
       : (currentContent ?? '');
 
     if (!error && fileExists && currentContent === newContent) {
@@ -247,6 +253,16 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       return false;
     }
 
+    // Capture file mtime BEFORE calculateEdit for race condition detection
+    // This must happen before reading to avoid TOCTOU gap
+    let capturedMtimeMs: number | undefined;
+    try {
+      const stats = await fs.promises.stat(this.params.file_path);
+      capturedMtimeMs = stats.mtimeMs;
+    } catch {
+      // File doesn't exist yet - will be caught in calculateEdit
+    }
+
     let editData: CalculatedEdit;
     try {
       editData = await this.calculateEdit(this.params);
@@ -261,6 +277,11 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       return false;
     }
 
+    // Only store mtime if file existed (not a new file creation)
+    if (!editData.isNewFile && capturedMtimeMs !== undefined) {
+      this.readMtimeMs = capturedMtimeMs;
+    }
+
     const fileName = path.basename(this.params.file_path);
     const fileDiff = Diff.createPatch(
       fileName,
@@ -273,7 +294,7 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
     const ideClient = this.config.getIdeClient();
     const ideConfirmation =
       this.config.getIdeMode() &&
-      ideClient?.getConnectionStatus().status === IDEConnectionStatus.Connected
+        ideClient?.getConnectionStatus().status === IDEConnectionStatus.Connected
         ? ideClient.openDiff(this.params.file_path, editData.newContent)
         : undefined;
 
@@ -297,6 +318,8 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
             // for info on a possible race condition where the file is modified on disk while being edited.
             this.params.old_string = editData.currentContent ?? '';
             this.params.new_string = result.content;
+            // Clear mtime check since IDE modified params - the file state has intentionally changed
+            this.readMtimeMs = undefined;
           }
         }
       },
@@ -333,6 +356,26 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
    * @returns Result of the edit operation
    */
   async execute(_signal: AbortSignal): Promise<ToolResult> {
+    // Check for race condition FIRST: file modified since we read it for confirmation
+    if (this.readMtimeMs !== undefined) {
+      try {
+        const currentStats = await fs.promises.stat(this.params.file_path);
+        if (currentStats.mtimeMs !== this.readMtimeMs) {
+          const errorMsg = `File was modified externally since it was read. Use ${ReadFileTool.Name} to get current content and retry the edit.`;
+          return {
+            llmContent: errorMsg,
+            returnDisplay: `Error: ${errorMsg}`,
+            error: {
+              message: errorMsg,
+              type: ToolErrorType.EDIT_FILE_MODIFIED_DURING_WAIT,
+            },
+          };
+        }
+      } catch {
+        // If we can't stat the file now, let calculateEdit handle the error
+      }
+    }
+
     let editData: CalculatedEdit;
     try {
       editData = await this.calculateEdit(this.params);
@@ -462,8 +505,7 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
  */
 export class EditTool
   extends BaseDeclarativeTool<EditToolParams, ToolResult>
-  implements ModifiableDeclarativeTool<EditToolParams>
-{
+  implements ModifiableDeclarativeTool<EditToolParams> {
   static readonly Name = ToolNames.EDIT;
   constructor(private readonly config: Config) {
     super(
